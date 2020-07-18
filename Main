@@ -1,0 +1,572 @@
+# REBOOT: rm(NO.CHECK_Q)
+
+#-#################################-#
+# Parameters
+#-#################################-#
+# Data
+#-------------------------------------------------------------#
+Data.size<-10^4#(sample(x=c(2:4),size = 1))
+noise.level<-.25#runif(n=1,min=.1,max=.5)
+# Roughness
+Hurst.param<- .5#runif(n=1,min=0.01,max=.99)
+# Noise Type
+alpha.param<-1.2#runif(n=1,min=1.75,max=2)
+# Signal
+f<-function(x){
+  #cos(exp(sin(x)))-sqrt(abs(x))
+  sin(sin(x))
+};f<-Vectorize(f) # Unknown function
+#-------------------------------------------------------------#
+# Network
+#-------------------------------------------------------------#
+Height<-10^2#(sample(x=c(1:3),size = 1))
+Depth<-2
+# Write (truncated) sequence of r_ns (note Inf is for the identity component)
+finness.grid<-c(Inf,c(Inf,seq(from=(10^-4),to=10,length.out = 10)))
+# Training
+epochs<-50#(sample(x=c(1:3),size = 1,prob = c(.4,.5,.1)))
+Batch.size.percent<-.75
+train.prop<-.5
+
+# Hardware
+Parralelize<-FALSE
+numCores<-parallel::detectCores()
+
+# Return LaTeX Formatted Output?
+LaTeX.output<-TRUE
+
+
+
+
+
+
+
+
+
+
+
+# Load packages
+### INITIALIZATION PORTION
+#-############ -----------------------------------################-#
+# Load required packages if available...if not install - BEGIN
+#-############ -----------------------------------################-#
+# Some packages should install this package manually and separately
+### The Script is in the file: Installations.R
+
+if(!exists("NO.CHECK_Q")){
+  # Check for missing packages
+  list.of.packages <- c("beepr","keras","dplyr","magrittr","neuralnet","mvtnorm","ggplot2","YieldCurve","Meucci","xtable","tibble","stabledist","somebm","foreach","doParallel","parallel","lubridate")
+  new.packages <- list.of.packages[!(list.of.packages %in% installed.packages()[,"Package"])]
+  # Download missing packages
+  if(length(new.packages)) install.packages(new.packages)
+  # Load packages requried for code...
+  lapply(list.of.packages, require, character.only = TRUE)
+  #
+  
+  # Ensure that this bit is not re-run until next time code it loaded
+  NO.CHECK_Q<-TRUE
+  # Signal that packags have been loaded and installed
+  beep()
+}
+#
+#-############ -----------------------------------################-#
+# Load required packages if available...if not install - END
+#-############ -----------------------------------################-#
+
+
+#####################--###
+# Data Initialization
+#####################--###
+# Set Seed
+set.seed(123)
+
+
+
+
+######################---#
+# Generate Data: Start
+######################---#
+### Data Generation
+set.seed(123)
+
+# X Data
+x.dat<-seq(from=0,to=10,length.out = Data.size)
+# Signal
+y.dat.pure.smooth.part<-f(x.dat)
+y.dat.pure.rough.part<- fbm(hurst = Hurst.param, n =( length(x.dat)-1))
+y.dat.pure<-y.dat.pure.smooth.part +y.dat.pure.rough.part
+
+# Noisy (Observed) Data
+y.dat<- y.dat.pure + rstable(n=Data.size, alpha=alpha.param, beta=0)*noise.level
+
+######################---#
+# Generate Data: END
+######################---#
+
+
+
+
+
+
+
+# Read/Format Data
+data<-cbind(x.dat,y.dat); data<-as.matrix(data)
+
+# Vilsulaize (Full) Dataset
+plot(x=x.dat,y=y.dat,col="blue",type="l")
+
+########
+# Define Training and Testing data subsets
+#------------------------------------------#
+ind<-sample(2,nrow(data),replace = T,prob=c(train.prop,(1-train.prop)))
+# Training
+train_data<-data[(ind==1),1]
+trainingtarget<-data[(ind==1),-1]
+# Test Data
+test_data<-data[(ind==2),1]
+testtarget<-data[(ind==2),-1]
+# Test Data (Pure)
+testtarget.pure<-y.dat.pure[(ind==2)]
+
+#-------------------------------#
+# Pre-processing
+#-------------------------------#
+# Normalize Training Data
+m.train<-mean(train_data)#colMeans(training)
+s.train<-sd(train_data)#apply(training,2,sd)
+train_data <- scale(train_data,center = m.train,scale = s.train) 
+
+# Use means and standard deviations from training set to normalize test set
+col_means_train <- attr(train_data, "scaled:center") 
+col_stddevs_train <- attr(train_data, "scaled:scale")
+test_data <- scale(test_data, center = m.train, scale = s.train)
+
+
+
+
+#------------------------------------#
+# Ping Start Training Time!!!! (BLNs)
+#------------------------------------#
+fit.BLN.start<-Sys.time()
+
+
+#### Prepare Matrix of In-Sample Evaluations for BLN Blocks
+train_data.block.predictions<-matrix(NA,nrow=length(train_data),ncol=length(finness.grid))
+#### Prepare Matrix of Predictions for BLN Blocks
+test_data.block.predictions<-matrix(NA,nrow=length(test_data),ncol=length(finness.grid))
+
+
+#----------------------------------------------------------------#
+#-############# Define Block Training Function #################-#
+#----------------------------------------------------------------#
+# Define Function
+train.Fit.BLN.block<-function(finness.number){ #Input: Entry number from finness index!
+# Initialize finness  
+  finness_m1 <- finness.grid[(finness.number-1)]
+  finness<-finness.grid[finness.number]
+#-############ -----------------------------------################-#
+# Pre-Process
+#-############ -----------------------------------################-#
+# Determine Indices of Truncated Outputs
+indices<-(abs(train_data)<=finness)& (finness_m1 < abs(train_data))
+train_data.block<-train_data[indices]
+trainingtarget.block<-trainingtarget[indices]
+# Test Data (Apply Threshholding in batch instead of input by input!)
+indices.test<-(abs(test_data)<=finness)
+test_data.block<-test_data[indices.test]
+testtarget.block<-testtarget[indices.test]
+
+
+#-------------------------------------------------#
+#-------------------------------------------------#
+# FAILSAFE 
+#-------------------------------------------------#
+#-----------------------------------------------------------#
+# Description: Check for Empty data-sets (after truncation!)
+#-----------------------------------------------------------#
+# Determine Test-Quantity
+BREAK.block<-(length(test_data.block)==0)|(length(testtarget.block)==0)|(length(train_data.block)==0)|(length(trainingtarget.block)==0)
+if(BREAK.block){# If Break should not occur
+  y.predict.BLN.Block<-NA
+}else{ # If Break should not occur
+
+#### Build BLN with specified Finess Level
+#-------------------------------#
+# Build Model BLN
+#-------------------------------#
+modelBLN<-keras_model_sequential()
+# Define bulk of the network
+modelBLN %>% layer_dense(units=Height,activation = "sigmoid",input_shape = 1)
+
+
+for(i in 1:Depth){
+  modelBLN %>% layer_dense(units=Height,activation = "sigmoid",input_shape = 1) 
+}
+
+# Readout Layer (BLN)
+modelBLN  %>% layer_dense(units=1)  
+
+
+# Compile (BLN)
+modelBLN %>% keras::compile(loss="mse",
+                            optimizer="adam",
+                            metrics="mse")
+
+
+
+## Report Model (Summary)
+# modelBLN %>% summary()
+
+# Compute Batch Size
+batch.size.block<-max(1,(round(min(1,abs(Batch.size.percent))*length(train_data.block),digits = 0)))
+
+# Fit BLN
+fittedmodel.BLN<- modelBLN %>%
+  keras::fit(train_data.block,
+             trainingtarget.block,
+             epochs=epochs,
+             batch_size=batch.size.block, # Computes batch-size as a percentage of total data-size
+  )
+
+
+# Output In-Sample Predictions
+#------------------------------#
+#Ensure that all data is the same shape at the end!
+# Training Set
+train_data.block.evaluation<-train_data
+train_data.block.evaluation[!indices]<-NaN 
+# Test Set
+test_data.block.evaluation<-test_data
+test_data.block.evaluation[!indices.test]<-NaN 
+
+
+# Evaluate Training-Set Predictions
+y.predict.BLN.Block<-modelBLN %>% predict(train_data.block.evaluation) #HERE!!!
+train_data.block.predictions[,finness.number]<<-as.numeric(y.predict.BLN.Block)
+# Evaluate Test-Set Predictions
+y.predict.BLN.Block.test<-modelBLN %>% predict(test_data.block.evaluation) #HERE!!!
+test_data.block.predictions[,finness.number]<<-as.numeric(y.predict.BLN.Block.test)
+
+}#END Non-breaked Version
+
+#### END FUNCTION!!!!
+}#### END fit.BLN.block function definintion
+# Output Optimal Finess Level
+
+########################-------------------------#
+###### END CV Step
+########################-------------------------#
+
+#------------------------------------#
+# Regress BLN Blocks Together!
+#------------------------------------#
+# Evaluate Training Function on Each Block
+if(!Parralelize){# Execute non-Parralelized code
+    lapply(X=seq(from=1,to=length(finness.grid)),FUN=train.Fit.BLN.block)
+  }else{ # Execute Parallelized code
+    parallel::mclapply(X=seq(from=2,to=length(finness.grid)),FUN=train.Fit.BLN.block, mc.cores = numCores)
+  }
+
+
+# Determine Columns with Valid Data (Note: Others arise from unevaluated networks (from lack of data))
+Valid.indices<-!(is.na(colSums(train_data.block.predictions)))
+# Purge NA Columns
+To.Regress<-train_data.block.predictions[,Valid.indices]
+# Set dummy NaN Entries to 0 (these represented the thresheld/localized inputes)
+To.Regress[is.nan(To.Regress)]<-0
+To.Regress[is.na(To.Regress)]<-0
+
+
+# Regress the lot and determine good choices of betas
+betas.fit<-lm(trainingtarget~To.Regress-1) #(This can be determined as the linear readout map)
+betas.fit<-as.numeric(betas.fit$coefficients)
+betas.fit[is.na(betas.fit)]<-0 # Remove NA Values
+#intercept.fit<-betas.fit[1]
+#betas.fit<-betas.fit[-1]
+
+# Predict Test Set
+#------------------#
+# Remove "Outputs" of Networks (actually they are skipped) "trained" on empty datasets
+test.to.bag<-test_data.block.predictions
+test.to.bag<-test.to.bag[,Valid.indices]
+test.to.bag[is.nan(test.to.bag)]<-0
+# Test Set Predictions
+y.predict.BLN<-as.numeric(test.to.bag%*%betas.fit)
+
+#------------------------------------#
+# Ping End Training Time!!!! (BLNs)
+#------------------------------------#
+fit.BLN.end<-Sys.time()
+
+
+
+
+# END BLN Training
+############################################################################################################----#
+############################################################################################################----#
+############################################################################################################----#
+############################################################################################################----#
+############################################################################################################----#
+############################################################################################################----#
+############################################################################################################----#
+############################################################################################################----#
+############################################################################################################----#
+############################################################################################################----#
+############################################################################################################----#
+############################################################################################################----#
+############################################################################################################----#
+
+#-------------------------------#
+# Build Model ffNN
+#-------------------------------#
+model<-keras_model_sequential()
+# Define bulk of the network
+model %>% layer_dense(units=Height,activation = "sigmoid",input_shape = 1)
+
+
+for(i in 1:Depth){
+  model %>% layer_dense(units=Height,activation = "sigmoid",input_shape = 1) 
+}
+
+# Readout Layer (ffNN)
+model %>% layer_dense(units=1)
+
+# Compile (ffNN)
+model %>% keras::compile(loss="mse",
+                         optimizer="adam",
+                         metrics="mse")
+
+
+## Report Model (Summary)
+model %>% summary()
+
+# Compute Batch Size
+batch.size<-max(1,(round(min(1,abs(Batch.size.percent))*length(train_data),digits = 0)))
+
+# Fit ffNN
+fit.ffNN.start<-Sys.time()
+fittedmodel<- model %>%
+  keras::fit(train_data,
+             trainingtarget,
+             epochs=epochs,
+             batch_size=batch.size)
+
+
+
+## Predictions ffNN
+y.predict<-model %>% predict(test_data)
+
+
+### END TIMER ffNNs
+fit.ffNN.end<-Sys.time()
+
+
+# Notify: Training Complete
+beep()
+
+
+#-------------------------------#
+# Build Model ffNN (Fully Connected)
+#-------------------------------#
+# Compute units required
+neuron.multiplier<-length(finness.grid)
+
+model.full<-keras_model_sequential()
+# Define bulk of the network
+model.full %>% layer_dense(units=(Height*neuron.multiplier),activation = "sigmoid",input_shape = 1)
+
+
+for(i in 1:Depth){
+  model.full %>% layer_dense(units=(Height*neuron.multiplier),activation = "sigmoid",input_shape = 1) 
+}
+
+# Readout Layer (ffNN)
+model.full %>% layer_dense(units=1)
+
+# Compile (ffNN)
+model.full %>% keras::compile(loss="mse",
+                              optimizer="adam",
+                              metrics="mse")
+
+
+## Report Model (Summary)
+model.full %>% summary()
+
+# Compute Batch Size
+batch.size<-max(1,(round(min(1,abs(Batch.size.percent))*length(train_data),digits = 0)))
+
+# Fit ffNN
+fit.ffNN.full.start<-Sys.time()
+fittedmodel<- model.full %>%
+  keras::fit(train_data,
+             trainingtarget,
+             epochs=epochs,
+             batch_size=batch.size)
+
+
+
+## Predictions ffNN
+y.predict.full<-model.full %>% predict(test_data)
+
+
+### END TIMER ffNNs
+fit.ffNN.full.end<-Sys.time()
+
+
+# Notify: Training Complete
+beep()
+
+
+
+#-------------------------------#
+# Build Model ffNN (Sparse Connected)
+#-------------------------------#
+# Compute units required
+sparse.dropout.rate<-(1-Height/(neuron.multiplier*Height))
+
+model.sparse<-keras_model_sequential()
+# Define bulk of the network
+model.sparse %>% layer_dense(units=(Height*neuron.multiplier),activation = "sigmoid",input_shape = 1) %>%
+  layer_dropout(rate = sparse.dropout.rate) 
+
+
+for(i in 1:Depth){
+  model.sparse %>% layer_dense(units=(Height*neuron.multiplier),activation = "sigmoid",input_shape = 1) %>%
+    layer_dropout(rate = sparse.dropout.rate) 
+}
+
+# Readout Layer (ffNN)
+model.sparse %>% layer_dense(units=1)
+
+# Compile (ffNN)
+model.sparse %>% keras::compile(loss="mse",
+                              optimizer="adam",
+                              metrics="mse")
+
+
+## Report Model (Summary)
+model.sparse %>% summary()
+
+# Compute Batch Size
+batch.size<-max(1,(round(min(1,abs(Batch.size.percent))*length(train_data),digits = 0)))
+
+# Fit ffNN
+fit.ffNN.sparse.start<-Sys.time()
+fittedmodel<- model.sparse %>%
+  keras::fit(train_data,
+             trainingtarget,
+             epochs=epochs,
+             batch_size=batch.size)
+
+
+
+## Predictions ffNN
+y.predict.sparse<-model.sparse %>% predict(test_data)
+
+
+### END TIMER ffNNs
+fit.ffNN.sparse.end<-Sys.time()
+
+
+###################----------------------------#
+# Feed-Forward Networks Bagged with Polynomials
+###################----------------------------#
+
+# Build polynomial regression data-frame
+y.predict.train<-model.sparse %>% predict(train_data)
+# Build Matrix for Polynomial Regression
+poly.bagging.regressors<-matrix(y.predict.train,nrow=length(finness.grid),ncol=length(y.predict.train),byrow=TRUE)
+poly.bagging.regressors<-(t(t(poly.bagging.regressors)^seq(from=1,to=ncol(poly.bagging.regressors))))
+
+# Regress the lot and determine good choices of betas
+betas.fit.poly<-lm(trainingtarget~t(poly.bagging.regressors)-1) #(This can be determined as the linear readout map)
+betas.fit.poly<-as.numeric(betas.fit.poly$coefficients)
+betas.fit.poly[is.na(betas.fit.poly)]<-0 # Remove NA Values
+
+# Predict Test Data
+poly.bagging.regressors.test<-matrix(y.predict.sparse,nrow=length(finness.grid),ncol=length(y.predict.sparse),byrow=TRUE)
+poly.bagging.regressors.test<-(t(t(poly.bagging.regressors.test)^seq(from=1,to=ncol(poly.bagging.regressors.test))))
+y.predict.poly<-as.numeric(betas.fit.poly%*%poly.bagging.regressors.test)
+
+# Stop Counting Polynomial Bagging Time
+fit.ffNN.poly.end<-Sys.time()
+# Notify: Training Complete
+beep()
+
+#-#############################################################-#
+#---------------------------------------------------------------#
+#                         Results                               #
+#---------------------------------------------------------------#
+#-#############################################################-#
+# Compute Relative-MSEs
+MSE.ffNN<-mean((testtarget.pure-as.numeric(y.predict))^2)
+rel.MSE.ffNN<-MSE.ffNN/mean((testtarget.pure)^2)
+MSE.ffNN.full<-mean((testtarget.pure-as.numeric(y.predict.full))^2)
+rel.MSE.ffNN.full<-MSE.ffNN.full/mean((testtarget.pure)^2)
+MSE.ffNN.sparse<-mean((testtarget.pure-as.numeric(y.predict.sparse))^2)
+rel.MSE.ffNN.sparse<-MSE.ffNN.sparse/mean((testtarget.pure)^2)
+MSE.ffNN.poly<-mean((testtarget.pure-as.numeric(y.predict.poly))^2)
+rel.MSE.ffNN.poly<-MSE.ffNN.poly/mean((testtarget.pure)^2)
+MSE.BLN<-mean((testtarget.pure-as.numeric(y.predict.BLN))^2)
+rel.MSE.BLN<-MSE.BLN/mean((testtarget.pure)^2)
+
+# Empirical Error SD
+ff.error.sd<-sd(testtarget.pure-as.numeric(y.predict))
+ff.full.error.sd<-sd(testtarget.pure-as.numeric(y.predict.full))
+ff.sparse.error.sd<-sd(testtarget.pure-as.numeric(y.predict.sparse))
+ff.poly.error.sd<-sd(testtarget.pure-as.numeric(y.predict.poly))
+BLN.error.sd<-sd(testtarget.pure-as.numeric(y.predict.BLN))
+
+# Compute Training Times
+ffNN.computation.time<-difftime(fit.ffNN.end,fit.ffNN.start,units = "secs")
+ffNN.full.computation.time<-difftime(fit.ffNN.full.end,fit.ffNN.full.start,units = "secs")
+ffNN.sparse.computation.time<-difftime(fit.ffNN.sparse.end,fit.ffNN.sparse.start,units = "secs")
+ffNN.poly.computation.time<-difftime(fit.ffNN.poly.end,fit.ffNN.sparse.start,units = "secs")
+BLN.computation.time<-difftime(fit.BLN.end,fit.BLN.start,units = "secs")
+
+# Compute number of parameters (Manually)
+n.params.ffNN<-(Height^2)*Depth
+n.params.full<-((neuron.multiplier*Height)^2)*Depth
+n.params.sparse<-n.params.full*(1-sparse.dropout.rate)
+n.params.poly<-n.params.full*(1-sparse.dropout.rate) + length(finness.grid)
+n.params.BLN<-(Height^2)*Depth*length(finness.grid)
+
+# Tabulate Results
+ffNN<-c(Hurst.param,alpha.param,noise.level,rel.MSE.ffNN,ff.error.sd,ffNN.computation.time,epochs,Data.size,n.params.ffNN)
+ffNN.full<-c(Hurst.param,alpha.param,noise.level,rel.MSE.ffNN.full,ff.full.error.sd,ffNN.full.computation.time,epochs,Data.size,n.params.full)
+ffNN.sparse<-c(Hurst.param,alpha.param,noise.level,rel.MSE.ffNN.sparse,ff.sparse.error.sd,ffNN.sparse.computation.time,epochs,Data.size,n.params.sparse)
+ffNN.poly<-c(Hurst.param,alpha.param,noise.level,rel.MSE.ffNN.poly,ff.poly.error.sd,ffNN.poly.computation.time,epochs,Data.size,n.params.poly)
+BLN<-c(Hurst.param,alpha.param,noise.level,rel.MSE.BLN,BLN.error.sd,BLN.computation.time,epochs,Data.size,n.params.BLN)
+Results<-as.data.frame(rbind(ffNN,ffNN.full,ffNN.sparse,BLN))
+colnames(Results)<-c("Hurst","alpha","sigma","rSSE","s.dev","c.time (sec)","epochs","Data Size","N.Params")
+rownames(Results)<-c("ffNN","ffNN+","ffNN-","BLN")
+
+
+#------------------#
+#-  Visualization -#
+#------------------#
+plot(x=test_data,y=testtarget.pure,col="black",type="l",xlab="",ylab="",lty=2)
+lines(x=test_data,y=y.predict,type="l",col="blue")
+lines(x=test_data,y=y.predict.full,type="l",col="green")
+lines(x=test_data,y=y.predict.sparse,type="l",col="red")
+lines(x=test_data,y=y.predict.poly,type="l",col="orange")
+lines(x=test_data,y=y.predict.BLN,type="l",col="purple")
+#--------------------#
+#- Numerical Report -#
+#--------------------#
+if(!LaTeX.output){# No LaTeX output
+
+print("BLBA!!!")
+
+Results}else{# Latex Output
+
+print(xtable::xtable(x=Results
+  , display = rep("g",10), 
+  digits=c(1,1,1,1,-3,-3,3,1,1,2)
+  ), math.style.exponents = T,
+  include.rownames=T,booktabs=F)
+  
+}
+
+print("Have a nice day!!! :)")
+Results
